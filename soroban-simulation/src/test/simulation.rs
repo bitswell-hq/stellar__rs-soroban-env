@@ -1,7 +1,7 @@
 use crate::simulation::{
     simulate_extend_ttl_op, simulate_invoke_host_function_op, simulate_restore_op,
-    ExtendTtlOpSimulationResult, LedgerEntryDiff, RestoreOpSimulationResult,
-    SimulationAdjustmentConfig, SimulationAdjustmentFactor,
+    ExtendTtlOpSimulationResult, InvokeHostFunctionSimulationResult, LedgerEntryDiff,
+    RestoreOpSimulationResult, SimulationAdjustmentConfig, SimulationAdjustmentFactor,
 };
 use crate::testutils::{ledger_entry_to_ledger_key, temp_entry, MockSnapshotSource};
 use crate::NetworkConfig;
@@ -15,6 +15,7 @@ use soroban_env_host::e2e_testutils::{
     AuthContractInvocationNode, CreateContractData,
 };
 use soroban_env_host::fees::{FeeConfiguration, RentFeeConfiguration};
+use soroban_env_host::storage::{EntryWithLiveUntil, SnapshotLookup, SnapshotSource};
 use soroban_env_host::xdr::{
     AccountId, AlphaNum4, AssetCode4, ContractCostParamEntry, ContractCostParams, ContractCostType,
     ContractDataDurability, ContractDataEntry, ContractExecutable, ContractId, ExtensionPoint,
@@ -27,7 +28,7 @@ use soroban_env_host::xdr::{
     TrustLineEntry, TrustLineEntryExt, TrustLineFlags, Uint256, VecM, WriteXdr,
 };
 use soroban_env_host::HostError;
-use soroban_test_wasms::{ADD_I32, AUTH_TEST_CONTRACT, TRY_CALL_SAC};
+use soroban_test_wasms::{ADD_I32, AUTH_TEST_CONTRACT, INVOKE_CONTRACT, TRY_CALL_SAC};
 use std::rc::Rc;
 use tap::prelude::*;
 
@@ -1594,4 +1595,166 @@ fn test_simulate_unsuccessful_sac_call_with_try_call() {
             resource_fee: res.transaction_data.as_ref().unwrap().resource_fee,
         })
     );
+}
+
+// Snapshot source backed by partial state: `unknown` keys are reported as
+// unknown, and every other key is resolved by `known`.
+struct PartialSnapshotSource {
+    known: MockSnapshotSource,
+    unknown: Vec<LedgerKey>,
+}
+
+impl SnapshotSource for PartialSnapshotSource {
+    fn get(&self, key: &Rc<LedgerKey>) -> Result<Option<EntryWithLiveUntil>, HostError> {
+        self.lookup(key)?.into_entry()
+    }
+
+    fn lookup(&self, key: &Rc<LedgerKey>) -> Result<SnapshotLookup, HostError> {
+        if self.unknown.contains(key.as_ref()) {
+            return Ok(SnapshotLookup::Unknown);
+        }
+        self.known.lookup(key)
+    }
+}
+
+fn simulate_with_snapshot(
+    snapshot_source: Rc<dyn SnapshotSource>,
+    host_fn: HostFunction,
+) -> InvokeHostFunctionSimulationResult {
+    simulate_invoke_host_function_op(
+        snapshot_source,
+        &default_network_config(),
+        &SimulationAdjustmentConfig::no_adjustments(),
+        &default_ledger_info(),
+        host_fn,
+        RecordingInvocationAuthMode::recording(true, true),
+        &get_account_id([123; 32]),
+        [1; 32],
+        true,
+    )
+    .unwrap()
+}
+
+fn invoke_add_i32_host_fn(contract_address: &ScAddress) -> HostFunction {
+    HostFunction::InvokeContract(InvokeContractArgs {
+        contract_address: contract_address.clone(),
+        function_name: "add".try_into().unwrap(),
+        args: vec![ScVal::I32(1), ScVal::I32(2)].try_into().unwrap(),
+    })
+}
+
+#[test]
+fn test_simulate_invoke_contract_with_unknown_entry() {
+    let contract = CreateContractData::new([1; 32], ADD_I32);
+    let live_until = default_ledger_info().sequence_number + 100;
+    let entries = vec![
+        (contract.wasm_entry.clone(), Some(live_until)),
+        (contract.contract_entry.clone(), Some(live_until)),
+    ];
+
+    for unknown_key in [contract.contract_key.clone(), contract.wasm_key.clone()] {
+        let snapshot_source = Rc::new(PartialSnapshotSource {
+            known: MockSnapshotSource::from_entries(entries.clone()).unwrap(),
+            unknown: vec![unknown_key.clone()],
+        });
+        let res = simulate_with_snapshot(
+            snapshot_source,
+            invoke_add_i32_host_fn(&contract.contract_address),
+        );
+
+        assert_eq!(res.unknown_ledger_keys, vec![unknown_key]);
+        assert!(HostError::result_matches_err(
+            res.invoke_result,
+            (ScErrorType::Storage, ScErrorCode::ExceededLimit)
+        ));
+        assert_eq!(res.auth, vec![]);
+        assert!(res.contract_events.is_empty());
+        assert_eq!(res.transaction_data, None);
+        assert_eq!(res.modified_entries, vec![]);
+    }
+}
+
+#[test]
+fn test_simulate_invoke_contract_without_unknown_entries_is_unchanged() {
+    let contract = CreateContractData::new([1; 32], ADD_I32);
+    let live_until = default_ledger_info().sequence_number + 100;
+    let all_entries = vec![
+        (contract.wasm_entry.clone(), Some(live_until)),
+        (contract.contract_entry.clone(), Some(live_until)),
+    ];
+    // Successful invocation, and an invocation that fails because the
+    // contract instance is absent.
+    for entries in [all_entries.clone(), all_entries[..1].to_vec()] {
+        let expected = simulate_with_snapshot(
+            Rc::new(MockSnapshotSource::from_entries(entries.clone()).unwrap()),
+            invoke_add_i32_host_fn(&contract.contract_address),
+        );
+        let res = simulate_with_snapshot(
+            Rc::new(PartialSnapshotSource {
+                known: MockSnapshotSource::from_entries(entries).unwrap(),
+                unknown: vec![],
+            }),
+            invoke_add_i32_host_fn(&contract.contract_address),
+        );
+
+        assert_eq!(res.unknown_ledger_keys, vec![]);
+        assert_eq!(
+            res.invoke_result.as_ref().map_err(|e| e.error),
+            expected.invoke_result.as_ref().map_err(|e| e.error)
+        );
+        assert_eq!(res.auth, expected.auth);
+        assert_eq!(res.contract_events, expected.contract_events);
+        assert_eq!(res.diagnostic_events, expected.diagnostic_events);
+        assert_eq!(res.transaction_data, expected.transaction_data);
+        assert_eq!(res.simulated_instructions, expected.simulated_instructions);
+        assert_eq!(res.simulated_memory, expected.simulated_memory);
+        assert_eq!(res.modified_entries, expected.modified_entries);
+    }
+}
+
+#[test]
+fn test_simulate_unknown_entry_in_try_call_is_not_recovered() {
+    let caller = CreateContractData::new([1; 32], INVOKE_CONTRACT);
+    let callee = CreateContractData::new([2; 32], ADD_I32);
+    let live_until = default_ledger_info().sequence_number + 100;
+    // `add_with_try` calls `add` on the callee with `try_call`, ignores the
+    // outcome and returns 0.
+    let host_fn = HostFunction::InvokeContract(InvokeContractArgs {
+        contract_address: caller.contract_address.clone(),
+        function_name: "add_with_try".try_into().unwrap(),
+        args: vec![
+            ScVal::I32(1),
+            ScVal::I32(2),
+            ScVal::Address(callee.contract_address.clone()),
+        ]
+        .try_into()
+        .unwrap(),
+    });
+    let partial_snapshot = |unknown: Vec<LedgerKey>| {
+        Rc::new(PartialSnapshotSource {
+            known: MockSnapshotSource::from_entries(vec![
+                (caller.wasm_entry.clone(), Some(live_until)),
+                (caller.contract_entry.clone(), Some(live_until)),
+                (callee.wasm_entry.clone(), Some(live_until)),
+            ])
+            .unwrap(),
+            unknown,
+        })
+    };
+
+    // An absent callee instance is a recoverable error that the caller
+    // ignores.
+    let res = simulate_with_snapshot(partial_snapshot(vec![]), host_fn.clone());
+    assert_eq!(res.unknown_ledger_keys, vec![]);
+    assert_eq!(res.invoke_result.unwrap(), ScVal::I32(0));
+
+    // An unknown callee instance can't be recovered from.
+    let res = simulate_with_snapshot(partial_snapshot(vec![callee.contract_key.clone()]), host_fn);
+    assert_eq!(res.unknown_ledger_keys, vec![callee.contract_key.clone()]);
+    assert!(HostError::result_matches_err(
+        res.invoke_result,
+        (ScErrorType::Storage, ScErrorCode::ExceededLimit)
+    ));
+    assert!(res.contract_events.is_empty());
+    assert_eq!(res.transaction_data, None);
 }

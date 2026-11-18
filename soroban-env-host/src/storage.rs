@@ -90,7 +90,57 @@ pub enum AccessType {
 pub trait SnapshotSource {
     /// Returns the ledger entry for the key and its live_until ledger if entry
     /// exists, or `None` otherwise.
+    ///
+    /// `None` means that the entry does not exist. A source that reports
+    /// [SnapshotLookup::Unknown] from [SnapshotSource::lookup] must not return
+    /// `None` for the same key; it can return `self.lookup(key)?.into_entry()`.
     fn get(&self, key: &Rc<LedgerKey>) -> Result<Option<EntryWithLiveUntil>, HostError>;
+
+    /// Looks up the ledger entry for the key, distinguishing an entry that
+    /// does not exist ([SnapshotLookup::Absent]) from an entry whose state
+    /// the source does not know ([SnapshotLookup::Unknown]), for example
+    /// because a source backed by partial state has not loaded it yet.
+    ///
+    /// The default implementation forwards to [SnapshotSource::get] and never
+    /// returns [SnapshotLookup::Unknown].
+    fn lookup(&self, key: &Rc<LedgerKey>) -> Result<SnapshotLookup, HostError> {
+        Ok(match self.get(key)? {
+            Some(entry) => SnapshotLookup::Present(entry),
+            None => SnapshotLookup::Absent,
+        })
+    }
+}
+
+/// The state of a [LedgerKey] in a [SnapshotSource], as returned by
+/// [SnapshotSource::lookup].
+#[derive(Clone, Debug)]
+pub enum SnapshotLookup {
+    /// The entry exists, with its live_until ledger (if any).
+    Present(EntryWithLiveUntil),
+    /// The entry does not exist.
+    Absent,
+    /// The source does not know whether the entry exists.
+    Unknown,
+}
+
+impl SnapshotLookup {
+    /// Converts the lookup result to the [SnapshotSource::get]
+    /// representation.
+    ///
+    /// [SnapshotLookup::Unknown] becomes a `(Storage, ExceededLimit)` error,
+    /// the same error as accessing a key outside of the footprint in
+    /// enforcing mode. The error is not recoverable, so a contract can
+    /// neither observe the missing state nor catch the error with
+    /// `try_call`.
+    pub fn into_entry(self) -> Result<Option<EntryWithLiveUntil>, HostError> {
+        match self {
+            SnapshotLookup::Present(entry) => Ok(Some(entry)),
+            SnapshotLookup::Absent => Ok(None),
+            SnapshotLookup::Unknown => {
+                Err((ScErrorType::Storage, ScErrorCode::ExceededLimit).into())
+            }
+        }
+    }
 }
 
 /// Describes the total set of [LedgerKey]s that a given transaction
