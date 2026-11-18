@@ -802,6 +802,13 @@ impl Storage {
         key: &Rc<LedgerKey>,
         host: &Host,
     ) -> Result<(), HostError> {
+        // Expired entries only need special handling in recording mode. Return
+        // early in enforcing mode so that it performs (and is charged for)
+        // exactly the same work regardless of whether recording mode support
+        // is compiled in.
+        if !matches!(self.mode, FootprintMode::Recording(_)) {
+            return Ok(());
+        }
         host.with_ledger_info(|li| {
             let budget = host.budget_ref();
             if let Some(Some((entry, live_until))) =
