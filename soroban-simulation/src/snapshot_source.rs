@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use soroban_env_host::ledger_info::get_key_durability;
-use soroban_env_host::storage::EntryWithLiveUntil;
+use soroban_env_host::storage::{EntryWithLiveUntil, SnapshotLookup};
 use soroban_env_host::xdr::{
     AccountEntry, AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext,
     AccountEntryExtensionV2, AccountEntryExtensionV2Ext, AccountEntryExtensionV3,
@@ -84,34 +84,37 @@ impl<T: SnapshotSource> AutoRestoringSnapshotSource<T> {
 
 impl<T: SnapshotSource> SnapshotSource for AutoRestoringSnapshotSource<T> {
     fn get(&self, key: &Rc<LedgerKey>) -> Result<Option<EntryWithLiveUntil>, HostError> {
-        let entry_with_live_until = self.snapshot_source.get(key)?;
-        if let Some((entry, live_until)) = entry_with_live_until {
-            if let Some(durability) = get_key_durability(key.as_ref()) {
-                let live_until = live_until.ok_or_else(|| {
-                    // Entries with durability must have TTL.
-                    HostError::from((ScErrorType::Storage, ScErrorCode::InternalError))
-                })?;
-                if live_until < self.current_ledger_sequence {
-                    return match durability {
-                        ContractDataDurability::Temporary => Ok(None),
-                        ContractDataDurability::Persistent => {
-                            let mut restored_ledger_keys =
-                                self.restored_ledger_keys.try_borrow_mut().map_err(|_| {
-                                    HostError::from((
-                                        ScErrorType::Context,
-                                        ScErrorCode::InternalError,
-                                    ))
-                                })?;
-                            restored_ledger_keys.insert(key.clone());
-                            Ok(Some((entry, Some(self.min_persistent_live_until_ledger))))
-                        }
-                    };
-                }
+        self.lookup(key)?.into_entry()
+    }
+
+    fn lookup(&self, key: &Rc<LedgerKey>) -> Result<SnapshotLookup, HostError> {
+        let (entry, live_until) = match self.snapshot_source.lookup(key)? {
+            SnapshotLookup::Present(entry_with_live_until) => entry_with_live_until,
+            absent_or_unknown => return Ok(absent_or_unknown),
+        };
+        if let Some(durability) = get_key_durability(key.as_ref()) {
+            let live_until = live_until.ok_or_else(|| {
+                // Entries with durability must have TTL.
+                HostError::from((ScErrorType::Storage, ScErrorCode::InternalError))
+            })?;
+            if live_until < self.current_ledger_sequence {
+                return match durability {
+                    ContractDataDurability::Temporary => Ok(SnapshotLookup::Absent),
+                    ContractDataDurability::Persistent => {
+                        let mut restored_ledger_keys =
+                            self.restored_ledger_keys.try_borrow_mut().map_err(|_| {
+                                HostError::from((ScErrorType::Context, ScErrorCode::InternalError))
+                            })?;
+                        restored_ledger_keys.insert(key.clone());
+                        Ok(SnapshotLookup::Present((
+                            entry,
+                            Some(self.min_persistent_live_until_ledger),
+                        )))
+                    }
+                };
             }
-            Ok(Some((entry, live_until)))
-        } else {
-            Ok(None)
         }
+        Ok(SnapshotLookup::Present((entry, live_until)))
     }
 }
 
@@ -163,6 +166,13 @@ impl SnapshotSource for SnapshotSourceHolder<'_> {
             SnapshotSourceHolder::Rc(r) => r.get(key),
         }
     }
+
+    fn lookup(&self, key: &Rc<LedgerKey>) -> Result<SnapshotLookup, HostError> {
+        match self {
+            SnapshotSourceHolder::Ref(r) => r.lookup(key),
+            SnapshotSourceHolder::Rc(r) => r.lookup(key),
+        }
+    }
 }
 
 // This is an internal wrapper for the snapshot sources used in the simulation.
@@ -170,9 +180,13 @@ impl SnapshotSource for SnapshotSourceHolder<'_> {
 // that Core might perform before the Soroban host operation is invoked. For example,
 // Core might create the account extensions, which would impact the read bytes
 // amount and simulated CPU instructions.
+// The wrapper also records the keys that the inner snapshot reported as
+// unknown, so that the simulation can report them regardless of how the host
+// has handled the resulting error.
 pub(crate) struct SimulationSnapshotSource<'a> {
     inner_snapshot: SnapshotSourceHolder<'a>,
     entry_updater: RefCell<LedgerEntryUpdater>,
+    unknown_keys: RefCell<BTreeSet<Rc<LedgerKey>>>,
 }
 
 impl<'a> SimulationSnapshotSource<'a> {
@@ -180,6 +194,7 @@ impl<'a> SimulationSnapshotSource<'a> {
         Self {
             inner_snapshot: SnapshotSourceHolder::Ref(snapshot),
             entry_updater: RefCell::new(Default::default()),
+            unknown_keys: RefCell::new(Default::default()),
         }
     }
 
@@ -187,16 +202,34 @@ impl<'a> SimulationSnapshotSource<'a> {
         Self {
             inner_snapshot: SnapshotSourceHolder::Rc(snapshot),
             entry_updater: RefCell::new(Default::default()),
+            unknown_keys: RefCell::new(Default::default()),
         }
+    }
+
+    /// Returns the keys that the inner snapshot has reported as unknown so
+    /// far, in key order.
+    pub(crate) fn unknown_keys(&self) -> Vec<LedgerKey> {
+        self.unknown_keys
+            .borrow()
+            .iter()
+            .map(|k| k.as_ref().clone())
+            .collect()
     }
 }
 
 impl SnapshotSource for SimulationSnapshotSource<'_> {
     fn get(&self, key: &Rc<LedgerKey>) -> Result<Option<EntryWithLiveUntil>, HostError> {
+        let lookup = self.inner_snapshot.lookup(key)?;
+        if matches!(lookup, SnapshotLookup::Unknown) {
+            self.unknown_keys
+                .try_borrow_mut()
+                .map_err(|_| HostError::from((ScErrorType::Context, ScErrorCode::InternalError)))?
+                .insert(key.clone());
+        }
         Ok(self
             .entry_updater
             .borrow_mut()
-            .maybe_update_entry(key, self.inner_snapshot.get(key)?))
+            .maybe_update_entry(key, lookup.into_entry()?))
     }
 }
 

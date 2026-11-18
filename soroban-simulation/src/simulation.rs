@@ -79,6 +79,15 @@ pub struct InvokeHostFunctionSimulationResult {
     /// the transaction execution.
     /// Empty for failed invocations.
     pub modified_entries: Vec<LedgerEntryDiff>,
+    /// Keys that the snapshot source reported as unknown (see
+    /// `SnapshotSource::lookup`) during the simulation.
+    ///
+    /// When non-empty, the simulation is incomplete rather than failed: the
+    /// invocation stopped at the first unknown entry, `invoke_result` holds
+    /// the resulting error and the other fields are populated as for a
+    /// failed invocation. Simulate again with a snapshot source that knows
+    /// whether these entries exist.
+    pub unknown_ledger_keys: Vec<LedgerKey>,
 }
 
 /// Result of simulating `ExtendFootprintTtlOp` operation.
@@ -117,6 +126,9 @@ pub struct RestoreOpSimulationResult {
 /// This function makes the best effort at returning non-Err result even
 /// for failed invocations. It should only fail if ledger is
 /// mis-configured (e.g. when computed fees cause overflows).
+///
+/// If `snapshot_source` reports an entry as unknown, the result lists it in
+/// `unknown_ledger_keys` instead of reporting a failed invocation.
 #[allow(clippy::too_many_arguments)]
 pub fn simulate_invoke_host_function_op(
     snapshot_source: Rc<dyn SnapshotSource>,
@@ -162,7 +174,11 @@ pub fn simulate_invoke_host_function_op(
         contract_events: vec![],
         transaction_data: None,
         modified_entries: vec![],
+        unknown_ledger_keys: snapshot_source.unknown_keys(),
     };
+    if !simulation_result.unknown_ledger_keys.is_empty() {
+        return Ok(simulation_result);
+    }
     let Ok(recording_result) = recording_result else {
         return Ok(simulation_result);
     };
